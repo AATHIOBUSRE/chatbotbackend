@@ -42,7 +42,8 @@ if not os.path.exists(DB_FILE):
             username TEXT UNIQUE NOT NULL,
             hashed_password TEXT NOT NULL
         )
-    """)
+    """
+    )
     cursor.execute("""
         CREATE TABLE chat_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,7 +53,8 @@ if not os.path.exists(DB_FILE):
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
-    """)
+    """
+    )
     connection.commit()
     connection.close()
 
@@ -94,6 +96,7 @@ def clean_text(text: str):
     text = re.sub(r"\s+", " ", text)  # Remove excessive whitespace
     text = text.replace("\n", " ").strip()
     return text
+
 def get_chat_history(user_id: int):
     connection = sqlite3.connect(DB_FILE)
     cursor = connection.cursor()
@@ -101,7 +104,6 @@ def get_chat_history(user_id: int):
     history = cursor.fetchall()
     connection.close()
     return [{"question": q, "answer": a} for q, a, t in history]
- 
 def get_chat_history_by_date(user_id: int, date: str):
     connection = sqlite3.connect(DB_FILE)
     cursor = connection.cursor()
@@ -109,7 +111,7 @@ def get_chat_history_by_date(user_id: int, date: str):
     history = cursor.fetchall()
     connection.close()
     return [{"question": q, "answer": a} for q, a, t in history]
- 
+
 
 # Endpoints
 @app.post("/register")
@@ -216,12 +218,16 @@ async def ask_question(question: str = Form(...), pdf_names: List[str] = Form(No
         """
         model = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.7)
         prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-        chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
-        response = chain({"input_documents": all_docs, "question": question}, return_only_outputs=True)
+        qa_chain = load_qa_chain(llm=model, chain_type="stuff", prompt=prompt)
 
-        # Save chat history and return
-        save_chat_history(current_user["id"], question, response["output_text"])
-        return {"question": question, "answer": response["output_text"]}
+        # Combine contexts from documents and generate an answer
+        combined_context = " ".join([doc.page_content for doc in all_docs])
+        answer = qa_chain.run(input_documents=all_docs, question=question)
+
+        # Save the question and answer to the user's chat history
+        save_chat_history(current_user["id"], question, answer)
+
+        return {"question": question, "answer": answer}
     except Exception as e:
         return {"error": str(e)}
 @app.get("/chat-history-by-date/")
