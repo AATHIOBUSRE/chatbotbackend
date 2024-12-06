@@ -42,8 +42,7 @@ if not os.path.exists(DB_FILE):
             username TEXT UNIQUE NOT NULL,
             hashed_password TEXT NOT NULL
         )
-    """
-    )
+    """)
     cursor.execute("""
         CREATE TABLE chat_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,8 +52,7 @@ if not os.path.exists(DB_FILE):
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
-    """
-    )
+    """)
     connection.commit()
     connection.close()
 
@@ -96,7 +94,6 @@ def clean_text(text: str):
     text = re.sub(r"\s+", " ", text)  # Remove excessive whitespace
     text = text.replace("\n", " ").strip()
     return text
-
 def get_chat_history(user_id: int):
     connection = sqlite3.connect(DB_FILE)
     cursor = connection.cursor()
@@ -111,6 +108,7 @@ def get_chat_history_by_date(user_id: int, date: str):
     history = cursor.fetchall()
     connection.close()
     return [{"question": q, "answer": a} for q, a, t in history]
+
 
 
 # Endpoints
@@ -186,8 +184,8 @@ async def process_pdf(files: List[UploadFile] = File(...), current_user: dict = 
 @app.post("/ask-question/")
 async def ask_question(question: str = Form(...), pdf_names: List[str] = Form(None), current_user: dict = Depends(get_current_user)):
     try:
-        # List to store relevant documents
         all_docs = []
+        relevant_vector_store = None  # Track the relevant vector store for updates
 
         # If specific PDFs are mentioned, load only those indices
         if pdf_names:
@@ -197,6 +195,10 @@ async def ask_question(question: str = Form(...), pdf_names: List[str] = Form(No
                 vector_store = FAISS.load_local(faiss_file, embeddings, allow_dangerous_deserialization=True)
                 docs = vector_store.similarity_search(question, k=5)
                 all_docs.extend(docs)
+
+                # Save the vector store related to the mentioned PDF
+                if pdf_name in question.lower():  # Match question topic with PDF name
+                    relevant_vector_store = (vector_store, faiss_file)
         else:
             # Load all FAISS indices for the user if no PDF is specified
             indices = [f for f in os.listdir() if f.startswith(f"faiss_index_{current_user['id']}_")]
@@ -205,6 +207,11 @@ async def ask_question(question: str = Form(...), pdf_names: List[str] = Form(No
                 vector_store = FAISS.load_local(index, embeddings, allow_dangerous_deserialization=True)
                 docs = vector_store.similarity_search(question, k=5)
                 all_docs.extend(docs)
+
+                # Save the vector store related to the topic
+                index_name = index.split(f"faiss_index_{current_user['id']}_")[1]
+                if index_name.lower() in question.lower():
+                    relevant_vector_store = (vector_store, index)
 
         # Ensure documents are retrieved
         if not all_docs:
@@ -226,6 +233,15 @@ async def ask_question(question: str = Form(...), pdf_names: List[str] = Form(No
 
         # Save the question and answer to the user's chat history
         save_chat_history(current_user["id"], question, answer)
+
+        # Add the generated answer to the relevant FAISS index
+        if relevant_vector_store:
+            vector_store, faiss_file = relevant_vector_store
+            new_text = f"Q: {question} A: {answer}"
+            vector_store.add_texts([new_text])  # Add new text to the vector store
+
+            # Save the updated FAISS index only for the relevant folder
+            vector_store.save_local(faiss_file)
 
         return {"question": question, "answer": answer}
     except Exception as e:
@@ -255,4 +271,6 @@ async def chat_history_grouped_by_date(current_user: dict = Depends(get_current_
         return {"history_by_date": grouped_history}
     except Exception as e:
         return {"error": str(e)}
+
+
 
