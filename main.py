@@ -1,9 +1,8 @@
 from fastapi import FastAPI, Depends, HTTPException, Form, UploadFile, File
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from fastapi.responses import JSONResponse
+from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from datetime import datetime, timedelta
 from typing import List
 import sqlite3
 import os
@@ -13,46 +12,63 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains.question_answering import load_qa_chain
 from langchain.prompts import PromptTemplate
 from langchain_community.vectorstores import FAISS
- 
-# Setup FastAPI and configurations
+import re
+from PyPDF2 import PdfReader
+
+# Setup FastAPI
 app = FastAPI()
- 
+
 # JWT Configuration
 SECRET_KEY = "your_secret_key"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
- 
+
 # Password hashing context
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
- 
+
 # Configure Google GenAI
 import google.generativeai as genai
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
- 
+
 # Database setup
 DB_FILE = "chatbot.db"
 if not os.path.exists(DB_FILE):
     connection = sqlite3.connect(DB_FILE)
     cursor = connection.cursor()
-    cursor.execute("CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, hashed_password TEXT NOT NULL)")
-    cursor.execute("CREATE TABLE chat_history (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, question TEXT, answer TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (user_id) REFERENCES users(id))")
+    cursor.execute("""
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            hashed_password TEXT NOT NULL
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE chat_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            question TEXT,
+            answer TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
     connection.commit()
     connection.close()
- 
-# Utility functions
+
+# Utility Functions
 def hash_password(password: str):
     return pwd_context.hash(password)
- 
+
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
- 
+
 def create_access_token(data: dict):
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
- 
+
 def get_user_from_db(username: str):
     connection = sqlite3.connect(DB_FILE)
     cursor = connection.cursor()
@@ -62,14 +78,22 @@ def get_user_from_db(username: str):
     if user:
         return {"id": user[0], "username": user[1], "hashed_password": user[2]}
     return None
- 
+
 def save_chat_history(user_id: int, question: str, answer: str):
     connection = sqlite3.connect(DB_FILE)
     cursor = connection.cursor()
-    cursor.execute("INSERT INTO chat_history (user_id, question, answer) VALUES (?, ?, ?)", (user_id, question, answer))
+    cursor.execute(
+        "INSERT INTO chat_history (user_id, question, answer) VALUES (?, ?, ?)",
+        (user_id, question, answer),
+    )
     connection.commit()
     connection.close()
- 
+
+def clean_text(text: str):
+    """Basic cleaning of text to improve embedding quality."""
+    text = re.sub(r"\s+", " ", text)  # Remove excessive whitespace
+    text = text.replace("\n", " ").strip()
+    return text
 def get_chat_history(user_id: int):
     connection = sqlite3.connect(DB_FILE)
     cursor = connection.cursor()
@@ -86,21 +110,24 @@ def get_chat_history_by_date(user_id: int, date: str):
     connection.close()
     return [{"question": q, "answer": a} for q, a, t in history]
  
-# Endpoint for user registration
+
+# Endpoints
 @app.post("/register")
 async def register(username: str = Form(...), password: str = Form(...)):
     try:
         hashed_password = hash_password(password)
         connection = sqlite3.connect(DB_FILE)
         cursor = connection.cursor()
-        cursor.execute("INSERT INTO users (username, hashed_password) VALUES (?, ?)", (username, hashed_password))
+        cursor.execute(
+            "INSERT INTO users (username, hashed_password) VALUES (?, ?)",
+            (username, hashed_password),
+        )
         connection.commit()
         connection.close()
         return {"message": "User registered successfully."}
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=400, detail="Username already exists")
- 
-# Endpoint for login and token generation
+
 @app.post("/token")
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     user = get_user_from_db(form_data.username)
@@ -108,8 +135,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     access_token = create_access_token(data={"sub": user["username"]})
     return {"access_token": access_token, "token_type": "bearer"}
- 
-# Helper to decode token and get current user
+
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -122,41 +148,66 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         return user
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
- 
-# Process PDF and store embeddings
+
 @app.post("/process-pdf/")
 async def process_pdf(files: List[UploadFile] = File(...), current_user: dict = Depends(get_current_user)):
     try:
-        # Extract text from PDFs
-        text = ""
+        processed_files = []
+        
         for pdf in files:
-            from PyPDF2 import PdfReader
+            # Extract text from the PDF
+            text = ""
             pdf_reader = PdfReader(pdf.file)
             for page in pdf_reader.pages:
-                text += page.extract_text()
-        # Chunk text and create embeddings
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=2500, chunk_overlap=300)
-        chunks = text_splitter.split_text(text)
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        vector_store = FAISS.from_texts(texts=chunks, embedding=embeddings)
-        vector_store.save_local(f"faiss_index_{current_user['id']}")
-        return {"message": "PDF processed successfully for user."}
+                extracted_text = page.extract_text()
+                text += clean_text(extracted_text)
+            
+            # Split text into chunks
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=4000, chunk_overlap=800)
+            chunks = text_splitter.split_text(text)
+
+            # Create embeddings for the chunks
+            embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+            vector_store = FAISS.from_texts(texts=chunks, embedding=embeddings)
+
+            # Save the FAISS index with a unique name per PDF
+            pdf_name = os.path.splitext(pdf.filename)[0]
+            faiss_file = f"faiss_index_{current_user['id']}_{pdf_name}"
+            vector_store.save_local(faiss_file)
+            
+            processed_files.append(pdf_name)
+
+        return {"message": f"Processed and saved embeddings for PDFs: {processed_files}"}
     except Exception as e:
         return {"error": str(e)}
- 
-# Chat endpoint
+
 @app.post("/ask-question/")
-async def ask_question(question: str = Form(None), current_user: dict = Depends(get_current_user)):
+async def ask_question(question: str = Form(...), pdf_names: List[str] = Form(None), current_user: dict = Depends(get_current_user)):
     try:
-        if not question:
-            # Retrieve chat history if no question provided
-            history = get_chat_history(current_user["id"])
-            return {"message": "Previous chat history retrieved.", "history": history}
- 
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        vector_store = FAISS.load_local(f"faiss_index_{current_user['id']}", embeddings, allow_dangerous_deserialization=True)
-        docs = vector_store.similarity_search(question)
- 
+        # List to store relevant documents
+        all_docs = []
+
+        # If specific PDFs are mentioned, load only those indices
+        if pdf_names:
+            for pdf_name in pdf_names:
+                faiss_file = f"faiss_index_{current_user['id']}_{pdf_name}"
+                embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+                vector_store = FAISS.load_local(faiss_file, embeddings, allow_dangerous_deserialization=True)
+                docs = vector_store.similarity_search(question, k=5)
+                all_docs.extend(docs)
+        else:
+            # Load all FAISS indices for the user if no PDF is specified
+            indices = [f for f in os.listdir() if f.startswith(f"faiss_index_{current_user['id']}_")]
+            for index in indices:
+                embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+                vector_store = FAISS.load_local(index, embeddings, allow_dangerous_deserialization=True)
+                docs = vector_store.similarity_search(question, k=5)
+                all_docs.extend(docs)
+
+        # Ensure documents are retrieved
+        if not all_docs:
+            return {"message": "No relevant documents found for the question."}
+
         # Setup conversation chain
         prompt_template = """
         Context: {context}
@@ -166,17 +217,13 @@ async def ask_question(question: str = Form(None), current_user: dict = Depends(
         model = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.7)
         prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
         chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
-        response = chain({"input_documents": docs, "question": question}, return_only_outputs=True)
- 
-        # Save and return chat history
+        response = chain({"input_documents": all_docs, "question": question}, return_only_outputs=True)
+
+        # Save chat history and return
         save_chat_history(current_user["id"], question, response["output_text"])
-        history = get_chat_history(current_user["id"])
-        return {"question": question, "answer": response["output_text"], "history": history}
+        return {"question": question, "answer": response["output_text"]}
     except Exception as e:
         return {"error": str(e)}
- 
-# Endpoint to get chat history by date
-# Endpoint to get all chat history grouped by date
 @app.get("/chat-history-by-date/")
 async def chat_history_grouped_by_date(current_user: dict = Depends(get_current_user)):
     try:
@@ -202,3 +249,4 @@ async def chat_history_grouped_by_date(current_user: dict = Depends(get_current_
         return {"history_by_date": grouped_history}
     except Exception as e:
         return {"error": str(e)}
+
