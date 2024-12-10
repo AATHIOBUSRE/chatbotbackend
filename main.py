@@ -14,9 +14,22 @@ from langchain.prompts import PromptTemplate
 from langchain_community.vectorstores import FAISS
 import re
 from PyPDF2 import PdfReader
+from fastapi.middleware.cors import CORSMiddleware
 
 # Setup FastAPI
 app = FastAPI()
+# cors 
+origins = [
+    "http://localhost",
+    "http://localhost:4200",
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # JWT Configuration
 SECRET_KEY = "your_secret_key"
@@ -39,6 +52,8 @@ if not os.path.exists(DB_FILE):
     cursor.execute("""
         CREATE TABLE users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
             username TEXT UNIQUE NOT NULL,
             hashed_password TEXT NOT NULL
         )
@@ -109,24 +124,33 @@ def get_chat_history_by_date(user_id: int, date: str):
     connection.close()
     return [{"question": q, "answer": a} for q, a, t in history]
 
-
-
 # Endpoints
 @app.post("/register")
-async def register(username: str = Form(...), password: str = Form(...)):
+async def register(
+    name: str = Form(...), 
+    email: str = Form(...), 
+    username: str = Form(...), 
+    password: str = Form(...)
+):
     try:
         hashed_password = hash_password(password)
         connection = sqlite3.connect(DB_FILE)
         cursor = connection.cursor()
         cursor.execute(
-            "INSERT INTO users (username, hashed_password) VALUES (?, ?)",
-            (username, hashed_password),
+            "INSERT INTO users (name, email, username, hashed_password) VALUES (?, ?, ?, ?)",
+            (name, email, username, hashed_password),
         )
         connection.commit()
         connection.close()
         return {"message": "User registered successfully."}
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=400, detail="Username already exists")
+    except sqlite3.IntegrityError as e:
+        error_message = str(e)
+        if "email" in error_message:
+            raise HTTPException(status_code=400, detail="Email'Id already exists")
+        elif "username" in error_message:
+            raise HTTPException(status_code=400, detail="Username already exists")
+        else:
+            raise HTTPException(status_code=400, detail="An error occurred during registration")
 
 @app.post("/token")
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
