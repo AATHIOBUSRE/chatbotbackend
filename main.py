@@ -1,5 +1,6 @@
 from typing import List
-from fastapi import FastAPI, Depends, HTTPException, Form, UploadFile, File, Header
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header
+from pydantic import BaseModel
 from datetime import datetime, timedelta
 from jose import jwt, JWTError
 from passlib.context import CryptContext
@@ -133,28 +134,38 @@ async def get_current_user(authorization: str = Header(...)) -> dict:
         raise HTTPException(status_code=404, detail="User not found")
     return user
 
+# Request Models
+class RegisterRequest(BaseModel):
+    name: str
+    email: str
+    username: str
+    password: str
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class AskQuestionRequest(BaseModel):
+    question: str
+    pdf_names: List[str] = None
+
 # Endpoints
 @app.post("/register")
-async def register(
-    name: str = Form(...), 
-    email: str = Form(...), 
-    username: str = Form(...), 
-    password: str = Form(...)
-):
+async def register(request: RegisterRequest):
     connection = None
     try:
-        hashed_password = hash_password(password)
+        hashed_password = hash_password(request.password)
         with sqlite3.connect(DB_FILE) as connection:
             cursor = connection.cursor()
             cursor.execute(
                 "INSERT INTO users (name, email, username, hashed_password) VALUES (?, ?, ?, ?)",
-                (name, email, username, hashed_password),
+                (request.name, request.email, request.username, hashed_password),
             )
             connection.commit()
         return {"message": "User registered successfully."}
     except sqlite3.IntegrityError as e:
         if connection:
-            connection.rollback()  # Rollback in case of errors
+            connection.rollback()
         error_message = str(e)
         if "email" in error_message:
             raise HTTPException(status_code=400, detail="Email ID already exists")
@@ -167,9 +178,9 @@ async def register(
             connection.close()
 
 @app.post("/login")
-async def login(username: str = Form(...), password: str = Form(...)):
-    user = get_user_from_db(username)
-    if not user or not verify_password(password, user["hashed_password"]):
+async def login(request: LoginRequest):
+    user = get_user_from_db(request.username)
+    if not user or not verify_password(request.password, user["hashed_password"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     access_token = create_access_token(data={"sub": user["username"], "user_id": user["id"]})
     return {"access_token": access_token, "token_type": "bearer"}
@@ -178,28 +189,24 @@ async def login(username: str = Form(...), password: str = Form(...)):
 async def process_pdf(files: List[UploadFile] = File(...), current_user: dict = Depends(get_current_user)):
     try:
         processed_files = []
-        
+
         for pdf in files:
-            # Extract text from the PDF
             text = ""
             pdf_reader = PdfReader(pdf.file)
             for page in pdf_reader.pages:
                 extracted_text = page.extract_text()
                 text += clean_text(extracted_text)
-            
-            # Split text into chunks
+
             text_splitter = RecursiveCharacterTextSplitter(chunk_size=4000, chunk_overlap=800)
             chunks = text_splitter.split_text(text)
 
-            # Create embeddings for the chunks
             embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
             vector_store = FAISS.from_texts(texts=chunks, embedding=embeddings)
 
-            # Save the FAISS index with a unique name per PDF
             pdf_name = os.path.splitext(pdf.filename)[0]
             faiss_file = f"faiss_index_{current_user['id']}_{pdf_name}"
             vector_store.save_local(faiss_file)
-            
+
             processed_files.append(pdf_name)
 
         return {"message": f"Processed and saved embeddings for PDFs: {processed_files}"}
@@ -207,46 +214,36 @@ async def process_pdf(files: List[UploadFile] = File(...), current_user: dict = 
         return {"error": str(e)}
 
 @app.post("/ask-question/")
-async def ask_question(
-    question: str = Form(...),
-    pdf_names: List[str] = Form(None),
-    current_user: dict = Depends(get_current_user)
-):
+async def ask_question(request: AskQuestionRequest, current_user: dict = Depends(get_current_user)):
     try:
         all_docs = []
-        relevant_vector_store = None  # Track the relevant vector store for updates
+        relevant_vector_store = None
 
-        # If specific PDFs are mentioned, load only those indices
-        if pdf_names:
-            for pdf_name in pdf_names:
+        if request.pdf_names:
+            for pdf_name in request.pdf_names:
                 faiss_file = f"faiss_index_{current_user['id']}_{pdf_name}"
                 embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
                 vector_store = FAISS.load_local(faiss_file, embeddings, allow_dangerous_deserialization=True)
-                docs = vector_store.similarity_search(question, k=5)
+                docs = vector_store.similarity_search(request.question, k=5)
                 all_docs.extend(docs)
 
-                # Save the vector store related to the mentioned PDF
-                if pdf_name in question.lower():  # Match question topic with PDF name
+                if pdf_name in request.question.lower():
                     relevant_vector_store = (vector_store, faiss_file)
         else:
-            # Load all FAISS indices for the user if no PDF is specified
             indices = [f for f in os.listdir() if f.startswith(f"faiss_index_{current_user['id']}_")]
             for index in indices:
                 embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
                 vector_store = FAISS.load_local(index, embeddings, allow_dangerous_deserialization=True)
-                docs = vector_store.similarity_search(question, k=5)
+                docs = vector_store.similarity_search(request.question, k=5)
                 all_docs.extend(docs)
 
-                # Save the vector store related to the topic
                 index_name = index.split(f"faiss_index_{current_user['id']}_")[1]
-                if index_name.lower() in question.lower():
+                if index_name.lower() in request.question.lower():
                     relevant_vector_store = (vector_store, index)
 
-        # Ensure documents are retrieved
         if not all_docs:
             return {"message": "No relevant documents found for the question."}
 
-        # Setup conversation chain
         prompt_template = """
         Context: {context}
         Question: {question}
@@ -256,23 +253,18 @@ async def ask_question(
         prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
         qa_chain = load_qa_chain(llm=model, chain_type="stuff", prompt=prompt)
 
-        # Combine contexts from documents and generate an answer
         combined_context = " ".join([doc.page_content for doc in all_docs])
-        answer = qa_chain.run(input_documents=all_docs, question=question)
+        answer = qa_chain.run(input_documents=all_docs, question=request.question)
 
-        # Save the question and answer to the user's chat history
-        save_chat_history(current_user["id"], question, answer)
+        save_chat_history(current_user["id"], request.question, answer)
 
-        # Add the generated answer to the relevant FAISS index
         if relevant_vector_store:
             vector_store, faiss_file = relevant_vector_store
-            new_text = f"Q: {question} A: {answer}"
-            vector_store.add_texts([new_text])  # Add new text to the vector store
-
-            # Save the updated FAISS index only for the relevant folder
+            new_text = f"Q: {request.question} A: {answer}"
+            vector_store.add_texts([new_text])
             vector_store.save_local(faiss_file)
 
-        return {"question": question, "answer": answer}
+        return {"question": request.question, "answer": answer}
     except Exception as e:
         return {"error": str(e)}
 
@@ -287,17 +279,16 @@ async def chat_history_grouped_by_date(current_user: dict = Depends(get_current_
         )
         history = cursor.fetchall()
         connection.close()
-        
+
         if not history:
             return {"message": "No chat history found."}
 
-        # Group chat history by date
         grouped_history = {}
         for question, answer, chat_date in history:
             if chat_date not in grouped_history:
                 grouped_history[chat_date] = []
             grouped_history[chat_date].append({"question": question, "answer": answer})
-        
+
         return {"history_by_date": grouped_history}
     except Exception as e:
         return {"error": str(e)}
