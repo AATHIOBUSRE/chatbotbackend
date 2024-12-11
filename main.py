@@ -1,5 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Form, UploadFile, File
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi import FastAPI, Depends, HTTPException, Form, UploadFile, File, Header
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -15,10 +14,12 @@ from langchain_community.vectorstores import FAISS
 import re
 from PyPDF2 import PdfReader
 from fastapi.middleware.cors import CORSMiddleware
+import time
 
 # Setup FastAPI
 app = FastAPI()
-# cors 
+
+# Enable CORS
 origins = [
     "http://localhost",
     "http://localhost:4200",
@@ -35,7 +36,6 @@ app.add_middleware(
 SECRET_KEY = "your_secret_key"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 # Password hashing context
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -48,6 +48,7 @@ genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 DB_FILE = "chatbot.db"
 if not os.path.exists(DB_FILE):
     connection = sqlite3.connect(DB_FILE)
+    connection.execute("PRAGMA journal_mode=WAL;")
     cursor = connection.cursor()
     cursor.execute("""
         CREATE TABLE users (
@@ -84,45 +85,57 @@ def create_access_token(data: dict):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+def decode_access_token(token: str) -> dict:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
 def get_user_from_db(username: str):
-    connection = sqlite3.connect(DB_FILE)
-    cursor = connection.cursor()
-    cursor.execute("SELECT id, username, hashed_password FROM users WHERE username = ?", (username,))
-    user = cursor.fetchone()
-    connection.close()
-    if user:
-        return {"id": user[0], "username": user[1], "hashed_password": user[2]}
+    with sqlite3.connect(DB_FILE) as connection:
+        cursor = connection.cursor()
+        cursor.execute("SELECT id, username, hashed_password FROM users WHERE username = ?", (username,))
+        user = cursor.fetchone()
+        if user:
+            return {"id": user[0], "username": user[1], "hashed_password": user[2]}
     return None
 
 def save_chat_history(user_id: int, question: str, answer: str):
-    connection = sqlite3.connect(DB_FILE)
-    cursor = connection.cursor()
-    cursor.execute(
-        "INSERT INTO chat_history (user_id, question, answer) VALUES (?, ?, ?)",
-        (user_id, question, answer),
-    )
-    connection.commit()
-    connection.close()
+    retry_count = 5
+    while retry_count > 0:
+        try:
+            with sqlite3.connect(DB_FILE) as connection:
+                cursor = connection.cursor()
+                cursor.execute(
+                    "INSERT INTO chat_history (user_id, question, answer) VALUES (?, ?, ?)",
+                    (user_id, question, answer),
+                )
+                connection.commit()
+            return
+        except sqlite3.OperationalError:
+            retry_count -= 1
+            time.sleep(0.1)
+    raise HTTPException(status_code=500, detail="Database is locked")
 
 def clean_text(text: str):
     """Basic cleaning of text to improve embedding quality."""
     text = re.sub(r"\s+", " ", text)  # Remove excessive whitespace
     text = text.replace("\n", " ").strip()
     return text
-def get_chat_history(user_id: int):
-    connection = sqlite3.connect(DB_FILE)
-    cursor = connection.cursor()
-    cursor.execute("SELECT question, answer, timestamp FROM chat_history WHERE user_id = ?", (user_id,))
-    history = cursor.fetchall()
-    connection.close()
-    return [{"question": q, "answer": a} for q, a, t in history]
-def get_chat_history_by_date(user_id: int, date: str):
-    connection = sqlite3.connect(DB_FILE)
-    cursor = connection.cursor()
-    cursor.execute("SELECT question, answer, timestamp FROM chat_history WHERE user_id = ? AND DATE(timestamp) = ?", (user_id, date))
-    history = cursor.fetchall()
-    connection.close()
-    return [{"question": q, "answer": a} for q, a, t in history]
+
+async def get_current_user(authorization: str = Header(...)) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization header missing or invalid")
+    token = authorization.split(" ")[1]
+    payload = decode_access_token(token)
+    username = payload.get("sub")
+    if not username:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+    user = get_user_from_db(username)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
 
 # Endpoints
 @app.post("/register")
@@ -134,44 +147,30 @@ async def register(
 ):
     try:
         hashed_password = hash_password(password)
-        connection = sqlite3.connect(DB_FILE)
-        cursor = connection.cursor()
-        cursor.execute(
-            "INSERT INTO users (name, email, username, hashed_password) VALUES (?, ?, ?, ?)",
-            (name, email, username, hashed_password),
-        )
-        connection.commit()
-        connection.close()
+        with sqlite3.connect(DB_FILE) as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                "INSERT INTO users (name, email, username, hashed_password) VALUES (?, ?, ?, ?)",
+                (name, email, username, hashed_password),
+            )
+            connection.commit()
         return {"message": "User registered successfully."}
     except sqlite3.IntegrityError as e:
         error_message = str(e)
         if "email" in error_message:
-            raise HTTPException(status_code=400, detail="Email'Id already exists")
+            raise HTTPException(status_code=400, detail="Email ID already exists")
         elif "username" in error_message:
             raise HTTPException(status_code=400, detail="Username already exists")
         else:
             raise HTTPException(status_code=400, detail="An error occurred during registration")
 
-@app.post("/token")
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = get_user_from_db(form_data.username)
-    if not user or not verify_password(form_data.password, user["hashed_password"]):
+@app.post("/login")
+async def login(username: str = Form(...), password: str = Form(...)):
+    user = get_user_from_db(username)
+    if not user or not verify_password(password, user["hashed_password"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    access_token = create_access_token(data={"sub": user["username"]})
+    access_token = create_access_token(data={"sub": user["username"], "user_id": user["id"]})
     return {"access_token": access_token, "token_type": "bearer"}
-
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        if not username:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        user = get_user_from_db(username)
-        if not user:
-            raise HTTPException(status_code=401, detail="User not found")
-        return user
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
 
 @app.post("/process-pdf/")
 async def process_pdf(files: List[UploadFile] = File(...), current_user: dict = Depends(get_current_user)):
@@ -206,7 +205,11 @@ async def process_pdf(files: List[UploadFile] = File(...), current_user: dict = 
         return {"error": str(e)}
 
 @app.post("/ask-question/")
-async def ask_question(question: str = Form(...), pdf_names: List[str] = Form(None), current_user: dict = Depends(get_current_user)):
+async def ask_question(
+    question: str = Form(...),
+    pdf_names: List[str] = Form(None),
+    current_user: dict = Depends(get_current_user)
+):
     try:
         all_docs = []
         relevant_vector_store = None  # Track the relevant vector store for updates
@@ -270,6 +273,7 @@ async def ask_question(question: str = Form(...), pdf_names: List[str] = Form(No
         return {"question": question, "answer": answer}
     except Exception as e:
         return {"error": str(e)}
+
 @app.get("/chat-history-by-date/")
 async def chat_history_grouped_by_date(current_user: dict = Depends(get_current_user)):
     try:
@@ -295,6 +299,3 @@ async def chat_history_grouped_by_date(current_user: dict = Depends(get_current_
         return {"history_by_date": grouped_history}
     except Exception as e:
         return {"error": str(e)}
-
-
-
