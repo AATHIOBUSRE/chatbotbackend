@@ -1,8 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, Form, UploadFile, File, Header
 from datetime import datetime, timedelta
-from jose import JWTError, jwt
+from jose import jwt, JWTError
 from passlib.context import CryptContext
-from typing import List
 import sqlite3
 import os
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -40,10 +39,6 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30
 # Password hashing context
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# Configure Google GenAI
-import google.generativeai as genai
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-
 # Database setup
 DB_FILE = "chatbot.db"
 if not os.path.exists(DB_FILE):
@@ -73,13 +68,13 @@ if not os.path.exists(DB_FILE):
     connection.close()
 
 # Utility Functions
-def hash_password(password: str):
+def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
-def verify_password(plain_password, hashed_password):
+def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
-def create_access_token(data: dict):
+def create_access_token(data: dict) -> str:
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
@@ -145,6 +140,7 @@ async def register(
     username: str = Form(...), 
     password: str = Form(...)
 ):
+    connection = None
     try:
         hashed_password = hash_password(password)
         with sqlite3.connect(DB_FILE) as connection:
@@ -156,6 +152,8 @@ async def register(
             connection.commit()
         return {"message": "User registered successfully."}
     except sqlite3.IntegrityError as e:
+        if connection:
+            connection.rollback()  # Rollback in case of errors
         error_message = str(e)
         if "email" in error_message:
             raise HTTPException(status_code=400, detail="Email ID already exists")
@@ -163,6 +161,9 @@ async def register(
             raise HTTPException(status_code=400, detail="Username already exists")
         else:
             raise HTTPException(status_code=400, detail="An error occurred during registration")
+    finally:
+        if connection:
+            connection.close()
 
 @app.post("/login")
 async def login(username: str = Form(...), password: str = Form(...)):
