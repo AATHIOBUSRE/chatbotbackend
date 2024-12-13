@@ -28,6 +28,7 @@ origins = [
     "http://localhost",
     "http://localhost:4200",
 ]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
