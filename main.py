@@ -219,7 +219,6 @@ async def ask_question(request: AskQuestionRequest, current_user: dict = Depends
     try:
         all_docs = []
         relevant_vector_store = None
- 
         # Step 1: Retrieve relevant documents from FAISS vector stores
         indices = [f for f in os.listdir() if f.startswith(f"faiss_index_{current_user['id']}_")]
         for index in indices:
@@ -227,19 +226,18 @@ async def ask_question(request: AskQuestionRequest, current_user: dict = Depends
             vector_store = FAISS.load_local(index, embeddings, allow_dangerous_deserialization=True)
             docs = vector_store.similarity_search(request.question, k=5)
             all_docs.extend(docs)
- 
+
             index_name = index.split(f"faiss_index_{current_user['id']}_")[1]
             if index_name.lower() in request.question.lower():
                 relevant_vector_store = (vector_store, index)
- 
+
         if not all_docs:
             return {"message": "No relevant documents found for the question."}
- 
+
         # Step 2: Generate raw answer using QA Chain
         combined_context = " ".join([doc.page_content for doc in all_docs])
         prompt_template = """
         You are a helpful assistant. Answer the question based on the given context in a clear and professional manner.
- 
         Context: {context}
         Question: {question}
         Improved Answer:
@@ -248,13 +246,13 @@ async def ask_question(request: AskQuestionRequest, current_user: dict = Depends
         prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
         qa_chain = load_qa_chain(llm=model, chain_type="stuff", prompt=prompt)
         raw_answer = qa_chain.run(input_documents=all_docs, question=request.question)
- 
+
         print(f"Raw Answer from vector store: {raw_answer}")
- 
+
         # Step 3: Refine raw answer using Gemini API
         api_key = "AIzaSyA7ac82_39rm88KGfPR0TtIE-TFni7RlNg"
         external_api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={api_key}"
- 
+
         request_body = {
             "contents": [
                 {
@@ -262,10 +260,10 @@ async def ask_question(request: AskQuestionRequest, current_user: dict = Depends
                         {
                             "text": f"""
                             You are a professional assistant. Given the question and its rough answer, provide a structured, grammatically correct response.
- 
+
                             Question: {request.question}
                             Answer: {raw_answer.strip()}
- 
+
                             Ensure the response is natural, professional, and includes necessary context or framing to sound complete and well-structured.
                             """
                         }
@@ -273,9 +271,9 @@ async def ask_question(request: AskQuestionRequest, current_user: dict = Depends
                 }
             ]
         }
- 
+
         refined_answer = raw_answer.strip()  # Default to raw answer if refinement fails
- 
+
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
                 response = await client.post(
@@ -283,11 +281,11 @@ async def ask_question(request: AskQuestionRequest, current_user: dict = Depends
                     headers={"Content-Type": "application/json"},
                     json=request_body
                 )
- 
+
                 print(f"Request body sent to Gemini API: {request_body}")
                 print(f"Response status: {response.status_code}")
                 print(f"Response content: {response.text}")
- 
+
                 if response.status_code == 200:
                     # Parse response
                     refined_data = response.json()
@@ -302,24 +300,23 @@ async def ask_question(request: AskQuestionRequest, current_user: dict = Depends
                     print(f"API returned error: {response.status_code} - {response.text}")
         except (httpx.RequestError, httpx.HTTPStatusError, Exception) as err:
             print(f"Error occurred during Gemini API call: {err}")
- 
+
         # Step 4: Save chat history to the database
         save_chat_history(current_user["id"], request.question, refined_answer)
- 
+
         # Step 5: Update vector store with the new Q&A pair
         if relevant_vector_store:
             vector_store, faiss_file = relevant_vector_store
             new_text = f"Q: {request.question} A: {refined_answer}"
             vector_store.add_texts([new_text])
             vector_store.save_local(faiss_file)
- 
         # Step 6: Return the final structured answer
         return {"question": request.question, "answer": refined_answer}
     except Exception as e:
         return {"error": str(e)}
- 
- 
- 
+
+
+
 @app.get("/chat-history-by-date/")
 async def chat_history_grouped_by_date(current_user: dict = Depends(get_current_user)):
     try:
