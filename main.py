@@ -343,3 +343,22 @@ async def chat_history_grouped_by_date(current_user: dict = Depends(get_current_
         return {"history_by_date": grouped_history}
     except Exception as e:
         return {"error": str(e)}
+@app.delete("/clear-history/")
+async def clear_history(current_user: dict = Depends(get_current_user)):
+    """
+    Clear the chat history for the logged-in user.
+    """
+    try:
+        user_id = current_user["id"]
+
+        # Connect to the database and clear history
+        with sqlite3.connect(DB_FILE) as connection:
+            cursor = connection.cursor()
+            cursor.execute("DELETE FROM chat_history WHERE user_id = ?", (user_id,))
+            connection.commit()
+
+        return {"message": "Chat history cleared successfully."}
+    except sqlite3.OperationalError as e:
+        raise HTTPException(status_code=500, detail="Database error: " + str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="An unexpected error occurred: " + str(e))
