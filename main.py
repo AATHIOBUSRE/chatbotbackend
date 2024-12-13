@@ -17,6 +17,8 @@ import re
 from PyPDF2 import PdfReader
 from fastapi.middleware.cors import CORSMiddleware
 import time
+from dotenv import load_dotenv
+load_dotenv()
  
 # Setup FastAPI
 app = FastAPI()
@@ -250,7 +252,7 @@ async def ask_question(request: AskQuestionRequest, current_user: dict = Depends
         print(f"Raw Answer from vector store: {raw_answer}")
 
         # Step 3: Refine raw answer using Gemini API
-        api_key = "AIzaSyA7ac82_39rm88KGfPR0TtIE-TFni7RlNg"
+        api_key = os.getenv("GOOGLE_API_KEY")
         external_api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={api_key}"
 
         request_body = {
