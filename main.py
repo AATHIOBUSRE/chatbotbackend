@@ -8,8 +8,6 @@ from passlib.context import CryptContext
 import sqlite3
 import os
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains.question_answering import load_qa_chain
 from langchain.prompts import PromptTemplate
 from langchain_community.vectorstores import FAISS
@@ -18,11 +16,18 @@ from PyPDF2 import PdfReader
 from fastapi.middleware.cors import CORSMiddleware
 import time
 from dotenv import load_dotenv
+#from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEndpoint  # Use the new class
+#from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
+
 load_dotenv()
- 
 # Setup FastAPI
 app = FastAPI()
- 
 # Enable CORS
 origins = [
     "http://localhost",
@@ -40,7 +45,7 @@ app.add_middleware(
 # JWT Configuration
 SECRET_KEY = "your_secret_key"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 720
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
  
 # Password hashing context
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -123,6 +128,7 @@ def clean_text(text: str):
     """Basic cleaning of text to improve embedding quality."""
     text = re.sub(r"\s+", " ", text)  # Remove excessive whitespace
     text = text.replace("\n", " ").strip()
+    text = re.sub(r"(?<=\w) (?=\w@\w)", "", text)  # Fix spaces before email '@'
     return text
  
 async def get_current_user(authorization: str = Header(...)) -> dict:
@@ -187,163 +193,103 @@ async def login(request: LoginRequest):
     if not user or not verify_password(request.password, user["hashed_password"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     access_token = create_access_token(data={"sub": user["username"], "user_id": user["id"]})
-    return {"access_token": access_token, "token_type": "bearer"}
- 
+    return {"access_token": access_token, "token_type": "bearer","userName":user["username"]}
+
+Settings = {
+    "llm": HuggingFaceEndpoint(
+        endpoint_url="https://api-inference.huggingface.co/models/google/gemma-1.1-7b-it",
+        huggingfacehub_api_token=os.getenv("HUGGINGFACE_API_KEY"),  # Ensure API key is loaded
+        max_new_tokens=512,  # Pass explicitly
+        temperature=0.1,  # Pass explicitly
+    ),
+    "embed_model": HuggingFaceEmbeddings(
+        model_name="BAAI/bge-small-en-v1.5"
+    ),
+}
+
+
 @app.post("/process-pdf/")
 async def process_pdf(files: List[UploadFile] = File(...), current_user: dict = Depends(get_current_user)):
     try:
         processed_files = []
- 
+        embeddings = Settings["embed_model"]
+    
         for pdf in files:
             text = ""
             pdf_reader = PdfReader(pdf.file)
             for page in pdf_reader.pages:
                 extracted_text = page.extract_text()
-                text += clean_text(extracted_text)
- 
+                if extracted_text:
+                    text += extracted_text.strip() + "\n"
+
             text_splitter = RecursiveCharacterTextSplitter(chunk_size=4000, chunk_overlap=800)
             chunks = text_splitter.split_text(text)
- 
-            embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+
+            if not chunks:
+                continue
+
             vector_store = FAISS.from_texts(texts=chunks, embedding=embeddings)
- 
             pdf_name = os.path.splitext(pdf.filename)[0]
             faiss_file = f"faiss_index_{current_user['id']}_{pdf_name}"
             vector_store.save_local(faiss_file)
- 
+
             processed_files.append(pdf_name)
- 
-        return {"message": "Uploaded Successfully"}
+
+        return {"message": "Uploaded Successfully", "processed_files": processed_files}
     except Exception as e:
         return {"error": str(e)}
- 
+
 @app.post("/ask-question/")
-async def ask_question(request: AskQuestionRequest, current_user: dict = Depends(get_current_user)):
+async def ask_question(request: dict, current_user: dict = Depends(get_current_user)):
     try:
-        all_docs = []
-        relevant_vector_store = None
-        # Step 1: Retrieve relevant documents from FAISS vector stores
+        if "query" not in request:
+            raise HTTPException(status_code=400, detail="Missing 'query' parameter in request body.")
+
+        question_text = request["query"]
+        
+        # Find all FAISS indices belonging to the user
         indices = [f for f in os.listdir() if f.startswith(f"faiss_index_{current_user['id']}_")]
-        for index in indices:
-            embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-            vector_store = FAISS.load_local(index, embeddings, allow_dangerous_deserialization=True)
-            docs = vector_store.similarity_search(request.question, k=5)
-            all_docs.extend(docs)
+        
+        if not indices:
+            raise HTTPException(status_code=404, detail="No FAISS index found. Process a PDF first.")
 
-            index_name = index.split(f"faiss_index_{current_user['id']}_")[1]
-            if index_name.lower() in request.question.lower():
-                relevant_vector_store = (vector_store, index)
+        # Sort indices based on modification time (newest first)
+        indices.sort(key=os.path.getmtime, reverse=True)
 
-        if not all_docs:
-            return {"message": "No relevant documents found for the question."}
+        # Select the latest FAISS index
+        latest_index = indices[0]
 
-        # Step 2: Generate raw answer using QA Chain
-        combined_context = " ".join([doc.page_content for doc in all_docs])
+        embeddings = Settings["embed_model"]
+        vector_store = FAISS.load_local(latest_index, embeddings, allow_dangerous_deserialization=True)
+        retriever = vector_store.as_retriever()
+
+        docs = retriever.invoke(question_text)
+        combined_context = " ".join([doc.page_content for doc in docs])
+
+        # === Enhanced Prompt: Generate Summarized Answers ===
         prompt_template = """
-        You are a helpful assistant. Answer the question based on the given context in a clear and professional manner.
-        Context: {context}
-        Question: {question}
-        Improved Answer:
-        """
-        model = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.7)
+You are an AI assistant providing **clear and summarized answers** based on the given context.
+
+- Extract relevant details accurately.
+- Provide a **short but informative summary** instead of a one-word answer.
+- If a specific detail is missing, simply respond with **"Not available"** instead of mentioning that the text does not include it.
+
+Context: {context}
+Question: {question}
+Summarized Answer:
+"""
+        model = Settings["llm"]
         prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-        qa_chain = load_qa_chain(llm=model, chain_type="stuff", prompt=prompt)
-        raw_answer = qa_chain.run(input_documents=all_docs, question=request.question)
 
-        print(f"Raw Answer from vector store: {raw_answer}")
+        qa_chain = RetrievalQA.from_chain_type(llm=model, retriever=retriever, chain_type="stuff", chain_type_kwargs={"prompt": prompt})
+        raw_answer = qa_chain.invoke({"query": question_text})
 
-        # Step 3: Refine raw answer using Gemini API
-        api_key = os.getenv("GOOGLE_API_KEY")
-        external_api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={api_key}"
+        refined_answer = raw_answer.get("result", "Not available").strip()
 
-        request_body = {
-            "contents": [
-                {
-                    "parts": [
-                        {
-                            "text": f"""
-                            You are a professional assistant. Given the question and its rough answer, provide a structured, grammatically correct response.
-
-                            Question: {request.question}
-                            Answer: {raw_answer.strip()}
-
-                            Ensure the response is natural, professional, and includes necessary context or framing to sound complete and well-structured.
-                            """
-                        }
-                    ]
-                }
-            ]
-        }
-
-        refined_answer = raw_answer.strip()  # Default to raw answer if refinement fails
-
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-                response = await client.post(
-                    url=external_api_url,
-                    headers={"Content-Type": "application/json"},
-                    json=request_body
-                )
-
-                print(f"Request body sent to Gemini API: {request_body}")
-                print(f"Response status: {response.status_code}")
-                print(f"Response content: {response.text}")
-
-                if response.status_code == 200:
-                    # Parse response
-                    refined_data = response.json()
-                    # Check if the expected structure exists
-                    parts = refined_data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-                    if parts and "text" in parts[0]:
-                        refined_answer = parts[0]["text"]
-                        print(f"Refined answer: {refined_answer}")
-                    else:
-                        print("Text field not found in API response. Using raw answer.")
-                else:
-                    print(f"API returned error: {response.status_code} - {response.text}")
-        except (httpx.RequestError, httpx.HTTPStatusError, Exception) as err:
-            print(f"Error occurred during Gemini API call: {err}")
-
-        # Step 4: Save chat history to the database
-        save_chat_history(current_user["id"], request.question, refined_answer)
-
-        # Step 5: Update vector store with the new Q&A pair
-        if relevant_vector_store:
-            vector_store, faiss_file = relevant_vector_store
-            new_text = f"Q: {request.question} A: {refined_answer}"
-            vector_store.add_texts([new_text])
-            vector_store.save_local(faiss_file)
-        # Step 6: Return the final structured answer
-        return {"question": request.question, "answer": refined_answer}
+        return {"question": question_text, "answer": refined_answer}
     except Exception as e:
         return {"error": str(e)}
 
-
-
-@app.get("/chat-history-by-date/")
-async def chat_history_grouped_by_date(current_user: dict = Depends(get_current_user)):
-    try:
-        connection = sqlite3.connect(DB_FILE)
-        cursor = connection.cursor()
-        cursor.execute(
-            "SELECT question, answer, DATE(timestamp) as chat_date FROM chat_history WHERE user_id = ? ORDER BY timestamp",
-            (current_user["id"],)
-        )
-        history = cursor.fetchall()
-        connection.close()
- 
-        if not history:
-            return {"message": "No chat history found."}
- 
-        grouped_history = {}
-        for question, answer, chat_date in history:
-            if chat_date not in grouped_history:
-                grouped_history[chat_date] = []
-            grouped_history[chat_date].append({"question": question, "answer": answer})
- 
-        return {"history_by_date": grouped_history}
-    except Exception as e:
-        return {"error": str(e)}
 @app.delete("/clear-history/")
 async def clear_history(current_user: dict = Depends(get_current_user)):
     """
